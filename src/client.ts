@@ -8226,6 +8226,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         return this.http.authedRequest(undefined, Method.Post, "/keys/query", undefined, content);
     }
 
+    public async keysQuery(content: object): Promise<IDownloadKeyResult> {
+        return await this.http.authedRequest(undefined, Method.Post, "/keys/query", undefined, content);
+    }
+
     /**
      * Claim one-time keys
      *
@@ -8264,6 +8268,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         const path = "/keys/claim";
         return this.http.authedRequest(undefined, Method.Post, path, undefined, content);
     }
+
+        public async claimKeys(content: object): Promise<IClaimOTKsResult> {
+            return await this.http.authedRequest(undefined, Method.Post, "/keys/claim", undefined, content);
+        }
 
     /**
      * Ask the server for a list of users who have changed their device lists

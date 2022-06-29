@@ -29,7 +29,7 @@ import { IExportedDevice, OlmDevice } from "./OlmDevice";
 import * as olmlib from "./olmlib";
 import { DeviceInfoMap, DeviceList } from "./DeviceList";
 import { DeviceInfo, IDevice } from "./deviceinfo";
-import type { DecryptionAlgorithm, EncryptionAlgorithm } from "./algorithms";
+import { DecryptionAlgorithm, DecryptionError, EncryptionAlgorithm } from "./algorithms";
 import * as algorithms from "./algorithms";
 import { createCryptoStoreCacheCallbacks, CrossSigningInfo, DeviceTrustLevel, UserTrustLevel } from './CrossSigning';
 import { EncryptionSetupBuilder } from "./EncryptionSetup";
@@ -82,6 +82,19 @@ import { ISyncStateData } from "../sync";
 import { CryptoStore } from "./store/base";
 import { IVerificationChannel } from "./verification/request/Channel";
 import { TypedEventEmitter } from "../models/typed-event-emitter";
+import {
+    UserId,
+    DeviceId,
+    OlmMachine,
+    DeviceLists,
+    KeysUploadRequest,
+    RequestType,
+    RoomId,
+    EncryptionSettings,
+    KeysQueryRequest,
+    ToDeviceRequest,
+    KeysClaimRequest
+} from "../../rust/matrix_sdk_crypto";
 
 const DeviceVerification = DeviceInfo.DeviceVerification;
 
@@ -108,10 +121,10 @@ export const verificationMethods = {
 export type VerificationMethod = keyof typeof verificationMethods | string;
 
 export function isCryptoAvailable(): boolean {
-    return Boolean(global.Olm);
+    return true;
 }
 
-const MIN_FORCE_SESSION_INTERVAL_MS = 60 * 60 * 1000;
+// const MIN_FORCE_SESSION_INTERVAL_MS = 60 * 60 * 1000;
 
 interface IInitOpts {
     exportedOlmDevice?: IExportedDevice;
@@ -250,6 +263,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     public readonly backupManager: BackupManager;
     public readonly crossSigningInfo: CrossSigningInfo;
     public readonly olmDevice: OlmDevice;
+    public olmMachine: OlmMachine;
     public readonly deviceList: DeviceList;
     public readonly dehydrationManager: DehydrationManager;
     public readonly secretStorage: SecretStorage;
@@ -299,7 +313,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     //         deviceId: 1234567890000,
     //     },
     // }
-    private lastNewSessionForced: Record<string, Record<string, number>> = {};
+    // private lastNewSessionForced: Record<string, Record<string, number>> = {};
 
     // This flag will be unset whilst the client processes a sync response
     // so that we don't start requesting keys until we've actually finished
@@ -456,9 +470,16 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         logger.log("Crypto: loading device list...");
         await this.deviceList.load();
 
+        const user_id = new UserId(this.userId);
+        const device_id = new DeviceId(this.deviceId);
+        this.olmMachine = await new OlmMachine(user_id, device_id);
+
+        const identityKeys = this.olmMachine.identityKeys
+        logger.log("Crypto: olm machine identity keys " + JSON.stringify(identityKeys));
+
         // build our device keys: these will later be uploaded
-        this.deviceKeys["ed25519:" + this.deviceId] = this.olmDevice.deviceEd25519Key;
-        this.deviceKeys["curve25519:" + this.deviceId] = this.olmDevice.deviceCurve25519Key;
+        this.deviceKeys["ed25519:" + this.deviceId] = identityKeys.ed25519.toBase64();
+        this.deviceKeys["curve25519:" + this.deviceId] = identityKeys.curve25519.toBase64();
 
         logger.log("Crypto: fetching own devices...");
         let myDevices = this.deviceList.getRawStoredDevicesForUser(this.userId);
@@ -1333,7 +1354,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
                             devices[deviceId].keys[signame],
                         );
                         deviceIds.push(deviceId);
-                    } catch (e) {}
+                    } catch (e) { }
                 }
             }
         }
@@ -2017,7 +2038,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             this.fallbackCleanup = setTimeout(() => {
                 delete this.fallbackCleanup;
                 this.olmDevice.forgetOldFallbackKey();
-            }, 60*60*1000);
+            }, 60 * 60 * 1000);
         }
 
         await this.olmDevice.markKeysAsPublished();
@@ -2795,6 +2816,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             throw new Error("Cannot send encrypted messages in unknown rooms");
         }
 
+        await this.rustSendOutgoingRequests()
         const roomId = event.getRoomId();
 
         const alg = this.roomEncryptors[roomId];
@@ -2831,8 +2853,80 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             delete content['io.element.performance_metrics'];
         }
 
-        const encryptedContent = await alg.encryptMessage(room, event.getType(), content);
+        const members = await room.getEncryptionTargetMembers();
+        const roomMembers = members.map(u => new UserId(u.userId));
 
+        logger.log(`## RUST roomMembers ${JSON.stringify(members)}`);
+        try {
+            await this.olmMachine.updateTrackedUsers(roomMembers)
+        } catch (error) {
+            logger.log(`## RUST failed to update tracked users ${error}`);
+        }
+
+        try {
+            const requests = await this.olmMachine.getMissingSessions(roomMembers);
+            logger.log(`## RUST missing sessions raw IS ${requests}`);
+            logger.log(`## RUST missing sessions IS ${JSON.stringify(requests)}`);
+            logger.log(`## RUST missing sessions instance ${requests instanceof Array}`);
+            logger.log(`## RUST missing sessions instance kc ${requests instanceof KeysClaimRequest}`);
+
+            /* Returns `NULL` if no key claiming request needs to be sent
+            * out, otherwise it returns an `Array` where the first key is
+            * the transaction ID as a string, and the second key is the keys
+            * claim request serialized to JSON.
+            */
+            if (requests instanceof KeysClaimRequest) {
+                let claim: KeysClaimRequest = requests;
+                logger.log(`## RUST outgoing to claim request ${claim.body}`);
+                let jsonBody = JSON.parse(claim.body as any as string)
+
+                try {
+                    const response = await this.baseApis.claimKeys(jsonBody)
+
+                    logger.log(`## RUST send claim success ${response}`);
+                    await this.olmMachine.markRequestAsSent(
+                        claim.id as unknown as string,
+                        RequestType.ToDevice,
+                        JSON.stringify(response))
+                } catch (error) {
+                    logger.log(`## RUST failed to claim keys ${error}`);
+                }
+            }
+        } catch (error) {
+            logger.log(`## RUST failed to get missing sessions ${error}`);
+        }
+
+        await this.rustSendOutgoingRequests()
+        const encryptionSettings = new EncryptionSettings()
+        const toDevices = await this.olmMachine.shareRoomKey(new RoomId(room.roomId), roomMembers, encryptionSettings)
+        logger.log(`## RUST shareGroupSessions ${JSON.stringify(toDevices)}`);
+        if (toDevices instanceof Array) {
+            logger.log(`## RUST shareGroupSessions ${(toDevices).length}`);
+            toDevices.forEach(async request => {
+                if (request instanceof ToDeviceRequest) {
+                    let toDevice: ToDeviceRequest = request;
+                    logger.log(`## RUST outgoing to device request ${JSON.stringify(toDevice.body)}`);
+                    let jsonBody = JSON.parse(toDevice.body as any as string)
+
+                    try {
+                        const response = await this.baseApis.sendToDevice(jsonBody.event_type, jsonBody.messages, jsonBody.txn_id)
+                        logger.log(`## RUST send to device success ${response}`);
+                        await this.olmMachine.markRequestAsSent(
+                            toDevice.id as unknown as string,
+                            RequestType.ToDevice,
+                            JSON.stringify(response))
+                    } catch (error) {
+                        logger.log(`## RUST failed to send to device ${error}`);
+                    }
+
+                }
+            })
+        }
+        //const encryptedContent = await alg.encryptMessage(room, event.getType(), content);
+        const encryptedContentJ = await this.olmMachine.encryptRoomEvent(new RoomId(room.roomId), event.getType(), JSON.stringify(content))
+
+        const encryptedContent = JSON.parse(encryptedContentJ)
+        logger.debug(`## RUST Encrypted content via rust ${encryptedContentJ}`)
         if (mRelatesTo) {
             encryptedContent['m.relates_to'] = mRelatesTo;
         }
@@ -2874,8 +2968,32 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             };
         } else {
             const content = event.getWireContent();
-            const alg = this.getRoomDecryptor(event.getRoomId(), content.algorithm);
-            return alg.decryptEvent(event);
+            // a bit annoying that we don't know if it's a to_device or a room message
+            const alg = content.algorithm
+            if (alg == "m.megolm.v1.aes-sha2") {
+                try {
+                    let decrypted = await this.olmMachine.decryptRoomEvent(JSON.stringify(event.event), new RoomId(event.event.room_id));
+                    logger.debug(`## RUST decrypted content via rust ${decrypted}`)
+                    // expected output: "Success!"
+                    const dEvent = JSON.parse(decrypted.event);
+                    return {
+                        clearEvent: dEvent,
+                        senderCurve25519Key: decrypted.senderCurve25519Key,
+                        claimedEd25519Key: decrypted.senderClaimedEd25519Key,
+                        forwardingCurve25519KeyChain: decrypted.forwardingCurve25519KeyChain,
+                        untrusted: decrypted.untrusted,
+                    };
+                } catch (err) {
+                    throw new DecryptionError("RUST_DECRYPT_ERROR", err);
+                }
+            } else {
+                throw new DecryptionError(
+                    "UNSUPPORTED_ALG",
+                    "Not supported in poc yet",
+                );
+            }
+            // const alg = this.getRoomDecryptor(event.getRoomId(), content.algorithm);
+            // return alg.decryptEvent(event);
         }
     }
 
@@ -2903,6 +3021,37 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         await this.evalDeviceListChanges(syncDeviceLists);
     }
 
+    public async handlereceiveSyncChanges(toDevices: any, syncDeviceLists: ISyncDeviceLists, keysCount: any, fallback: any): Promise<void> {
+        
+        logger.log(`## RUST handlereceiveSyncChanges to_device count = ${toDevices?.events?.count}`);
+        var jsonToDeviceEvents;
+        try { 
+            jsonToDeviceEvents = await 
+                this.olmMachine.receiveSyncChanges(
+                    JSON.stringify(toDevices),
+                    new DeviceLists(syncDeviceLists?.changed || [], syncDeviceLists?.left || []),
+                    new Map(Object.entries(keysCount || {})),
+                    new Set(fallback || [])
+                )
+            } catch (rErr) { 
+                logger.debug("## RUST receiveSyncChanges failed " + rErr) 
+                // what to do here?
+            }
+
+        let parsed = JSON.parse(jsonToDeviceEvents)
+        logger.debug("## RUST parsed rust response is " + parsed)
+        if (parsed && parsed instanceof Array) {
+            parsed
+                .map(partial => new MatrixEvent(partial))
+                .forEach((ev) => {
+                    let type = ev.getType()
+                    logger.debug("## RUST parsed ev of type " + type)
+                    if ("m.room_key" == type) {
+                        // notify listeners?
+                    }
+                });
+        }
+    }
     /**
      * Send a request for some room keys, if we have not already done so
      *
@@ -3002,6 +3151,9 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      * @param {Object} syncData  the data from the 'MatrixClient.sync' event
      */
     public async onSyncCompleted(syncData: ISyncStateData): Promise<void> {
+
+        await this.rustSendOutgoingRequests()
+
         this.deviceList.setSyncToken(syncData.nextSyncToken);
         this.deviceList.saveIfDirty();
 
@@ -3021,10 +3173,88 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             // likewise don't start requesting keys until we've caught up
             // on to_device messages, otherwise we'll request keys that we're
             // just about to get.
-            this.outgoingRoomKeyRequestManager.sendQueuedRequests();
+            //this.outgoingRoomKeyRequestManager.sendQueuedRequests();
 
             // Sync has finished so send key requests straight away.
-            this.sendKeyRequestsImmediately = true;
+            //this.sendKeyRequestsImmediately = true;
+        }
+    }
+
+    private async rustSendOutgoingRequests() {
+        const outgoingRequests = await this.olmMachine.outgoingRequests()
+        logger.log(`## RUST outgoing request count = ${outgoingRequests.length}`);
+        if (outgoingRequests instanceof Array) {
+            outgoingRequests.forEach(async request => {
+                logger.log(`## RUST outgoing request ${JSON.stringify(request)}`);
+                if (request instanceof KeysUploadRequest) {
+                    let upload: KeysUploadRequest = request;
+                    logger.log(`## RUST outgoing key upload request ${JSON.stringify(upload.body)}`);
+                    try {
+                        const response = await this.baseApis.uploadKeysRequest(JSON.parse(upload.body as any as string))
+                        logger.log(`## RUST upload keys success ${response.one_time_key_counts}`);
+                        await this.olmMachine.markRequestAsSent(
+                            upload.id as unknown as string,
+                            RequestType.KeysUpload,
+                            JSON.stringify(response))
+                    } catch (error) {
+                        logger.log(`## RUST failed to upload keys ${error}`);
+                    }
+                } else if (request instanceof KeysQueryRequest) {
+                    let query: KeysQueryRequest = request;
+                    logger.log(`## RUST outgoing key query request ${JSON.stringify(query.body)}`);
+                    let jsonBody = JSON.parse(query.body as any as string)
+
+                    try {
+                        const response = await this.baseApis.keysQuery(jsonBody)
+                        logger.log(`## RUST keys query success ${response}`);
+                        await this.olmMachine.markRequestAsSent(
+                            query.id as unknown as string,
+                            RequestType.KeysQuery,
+                            JSON.stringify(response))
+                    } catch (error) {
+                        logger.log(`## RUST failed to query keys ${error}`);
+                    }
+                } else if (request instanceof ToDeviceRequest) {
+                    let toDevice: ToDeviceRequest = request;
+                    logger.log(`## RUST outgoing to device request ${JSON.stringify(toDevice.body)}`);
+                    let jsonBody = JSON.parse(toDevice.body as any as string)
+
+                    try {
+                        const response = await this.baseApis.sendToDevice(jsonBody.event_type, jsonBody.messages, jsonBody.txn_id)
+                        logger.log(`## RUST send to device success ${response}`);
+                        await this.olmMachine.markRequestAsSent(
+                            toDevice.id as unknown as string,
+                            RequestType.ToDevice,
+                            JSON.stringify(response))
+                    } catch (error) {
+                        logger.log(`## RUST failed to send to device ${error}`);
+                    }
+
+                } else if (request instanceof KeysClaimRequest) {
+                    let claim: KeysClaimRequest = request;
+                    logger.log(`## RUST outgoing to claim request ${claim.body}`);
+                    let jsonBody = JSON.parse(claim.body as any as string)
+
+                    try {
+                        const response = await this.baseApis.claimKeys(jsonBody)
+
+                        logger.log(`## RUST send claim success ${response}`);
+                        await this.olmMachine.markRequestAsSent(
+                            claim.id as unknown as string,
+                            RequestType.ToDevice,
+                            JSON.stringify(response))
+                    } catch (error) {
+                        logger.log(`## RUST failed to claim keys ${error}`);
+                    }
+                }
+                // *   * `KeysUploadRequest`,
+                // *   * `KeysQueryRequest`,
+                // *   * `KeysClaimRequest`,
+                // *   * `ToDeviceRequest`,
+                // *   * `SignatureUploadRequest`,
+                // *   * `RoomMessageRequest` or
+                // *   * `KeysBackupRequest`.
+            });
         }
     }
 
@@ -3106,130 +3336,130 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     };
 
     private onToDeviceEvent = (event: MatrixEvent): void => {
-        try {
-            logger.log(`received to_device ${event.getType()} from: ` +
-                `${event.getSender()} id: ${event.getId()}`);
+        // try {
+        //     logger.log(`received to_device ${event.getType()} from: ` +
+        //         `${event.getSender()} id: ${event.getId()}`);
 
-            if (event.getType() == "m.room_key"
-                || event.getType() == "m.forwarded_room_key") {
-                this.onRoomKeyEvent(event);
-            } else if (event.getType() == "m.room_key_request") {
-                this.onRoomKeyRequestEvent(event);
-            } else if (event.getType() === "m.secret.request") {
-                this.secretStorage.onRequestReceived(event);
-            } else if (event.getType() === "m.secret.send") {
-                this.secretStorage.onSecretReceived(event);
-            } else if (event.getType() === "m.room_key.withheld"
-                || event.getType() === "org.matrix.room_key.withheld") {
-                this.onRoomKeyWithheldEvent(event);
-            } else if (event.getContent().transaction_id) {
-                this.onKeyVerificationMessage(event);
-            } else if (event.getContent().msgtype === "m.bad.encrypted") {
-                this.onToDeviceBadEncrypted(event);
-            } else if (event.isBeingDecrypted() || event.shouldAttemptDecryption()) {
-                if (!event.isBeingDecrypted()) {
-                    event.attemptDecryption(this);
-                }
-                // once the event has been decrypted, try again
-                event.once(MatrixEventEvent.Decrypted, (ev) => {
-                    this.onToDeviceEvent(ev);
-                });
-            }
-        } catch (e) {
-            logger.error("Error handling toDeviceEvent:", e);
-        }
+        //     if (event.getType() == "m.room_key"
+        //         || event.getType() == "m.forwarded_room_key") {
+        //         this.onRoomKeyEvent(event);
+        //     } else if (event.getType() == "m.room_key_request") {
+        //         this.onRoomKeyRequestEvent(event);
+        //     } else if (event.getType() === "m.secret.request") {
+        //         this.secretStorage.onRequestReceived(event);
+        //     } else if (event.getType() === "m.secret.send") {
+        //         this.secretStorage.onSecretReceived(event);
+        //     } else if (event.getType() === "m.room_key.withheld"
+        //         || event.getType() === "org.matrix.room_key.withheld") {
+        //         this.onRoomKeyWithheldEvent(event);
+        //     } else if (event.getContent().transaction_id) {
+        //         this.onKeyVerificationMessage(event);
+        //     } else if (event.getContent().msgtype === "m.bad.encrypted") {
+        //         this.onToDeviceBadEncrypted(event);
+        //     } else if (event.isBeingDecrypted() || event.shouldAttemptDecryption()) {
+        //         if (!event.isBeingDecrypted()) {
+        //             event.attemptDecryption(this);
+        //         }
+        //         // once the event has been decrypted, try again
+        //         event.once(MatrixEventEvent.Decrypted, (ev) => {
+        //             this.onToDeviceEvent(ev);
+        //         });
+        //     }
+        // } catch (e) {
+        //     logger.error("Error handling toDeviceEvent:", e);
+        // }
     };
 
-    /**
-     * Handle a key event
-     *
-     * @private
-     * @param {module:models/event.MatrixEvent} event key event
-     */
-    private onRoomKeyEvent(event: MatrixEvent): void {
-        const content = event.getContent();
+    // /**
+    //  * Handle a key event
+    //  *
+    //  * @private
+    //  * @param {module:models/event.MatrixEvent} event key event
+    //  */
+    // private onRoomKeyEvent(event: MatrixEvent): void {
+    //     const content = event.getContent();
 
-        if (!content.room_id || !content.algorithm) {
-            logger.error("key event is missing fields");
-            return;
-        }
+    //     if (!content.room_id || !content.algorithm) {
+    //         logger.error("key event is missing fields");
+    //         return;
+    //     }
 
-        if (!this.backupManager.checkedForBackup) {
-            // don't bother awaiting on this - the important thing is that we retry if we
-            // haven't managed to check before
-            this.backupManager.checkAndStart();
-        }
+    //     if (!this.backupManager.checkedForBackup) {
+    //         // don't bother awaiting on this - the important thing is that we retry if we
+    //         // haven't managed to check before
+    //         this.backupManager.checkAndStart();
+    //     }
 
-        const alg = this.getRoomDecryptor(content.room_id, content.algorithm);
-        alg.onRoomKeyEvent(event);
-    }
+    //     const alg = this.getRoomDecryptor(content.room_id, content.algorithm);
+    //     alg.onRoomKeyEvent(event);
+    // }
 
-    /**
-     * Handle a key withheld event
-     *
-     * @private
-     * @param {module:models/event.MatrixEvent} event key withheld event
-     */
-    private onRoomKeyWithheldEvent(event: MatrixEvent): void {
-        const content = event.getContent();
+    // /**
+    //  * Handle a key withheld event
+    //  *
+    //  * @private
+    //  * @param {module:models/event.MatrixEvent} event key withheld event
+    //  */
+    // private onRoomKeyWithheldEvent(event: MatrixEvent): void {
+    //     const content = event.getContent();
 
-        if ((content.code !== "m.no_olm" && (!content.room_id || !content.session_id))
-            || !content.algorithm || !content.sender_key) {
-            logger.error("key withheld event is missing fields");
-            return;
-        }
+    //     if ((content.code !== "m.no_olm" && (!content.room_id || !content.session_id))
+    //         || !content.algorithm || !content.sender_key) {
+    //         logger.error("key withheld event is missing fields");
+    //         return;
+    //     }
 
-        logger.info(
-            `Got room key withheld event from ${event.getSender()} (${content.sender_key}) `
-            + `for ${content.algorithm}/${content.room_id}/${content.session_id} `
-            + `with reason ${content.code} (${content.reason})`,
-        );
+    //     logger.info(
+    //         `Got room key withheld event from ${event.getSender()} (${content.sender_key}) `
+    //         + `for ${content.algorithm}/${content.room_id}/${content.session_id} `
+    //         + `with reason ${content.code} (${content.reason})`,
+    //     );
 
-        const alg = this.getRoomDecryptor(content.room_id, content.algorithm);
-        if (alg.onRoomKeyWithheldEvent) {
-            alg.onRoomKeyWithheldEvent(event);
-        }
-        if (!content.room_id) {
-            // retry decryption for all events sent by the sender_key.  This will
-            // update the events to show a message indicating that the olm session was
-            // wedged.
-            const roomDecryptors = this.getRoomDecryptors(content.algorithm);
-            for (const decryptor of roomDecryptors) {
-                decryptor.retryDecryptionFromSender(content.sender_key);
-            }
-        }
-    }
+    //     const alg = this.getRoomDecryptor(content.room_id, content.algorithm);
+    //     if (alg.onRoomKeyWithheldEvent) {
+    //         alg.onRoomKeyWithheldEvent(event);
+    //     }
+    //     if (!content.room_id) {
+    //         // retry decryption for all events sent by the sender_key.  This will
+    //         // update the events to show a message indicating that the olm session was
+    //         // wedged.
+    //         const roomDecryptors = this.getRoomDecryptors(content.algorithm);
+    //         for (const decryptor of roomDecryptors) {
+    //             decryptor.retryDecryptionFromSender(content.sender_key);
+    //         }
+    //     }
+    // }
 
-    /**
-     * Handle a general key verification event.
-     *
-     * @private
-     * @param {module:models/event.MatrixEvent} event verification start event
-     */
-    private onKeyVerificationMessage(event: MatrixEvent): void {
-        if (!ToDeviceChannel.validateEvent(event, this.baseApis)) {
-            return;
-        }
-        const createRequest = (event: MatrixEvent) => {
-            if (!ToDeviceChannel.canCreateRequest(ToDeviceChannel.getEventType(event))) {
-                return;
-            }
-            const content = event.getContent();
-            const deviceId = content && content.from_device;
-            if (!deviceId) {
-                return;
-            }
-            const userId = event.getSender();
-            const channel = new ToDeviceChannel(
-                this.baseApis,
-                userId,
-                [deviceId],
-            );
-            return new VerificationRequest(
-                channel, this.verificationMethods, this.baseApis);
-        };
-        this.handleVerificationEvent(event, this.toDeviceVerificationRequests, createRequest);
-    }
+    // /**
+    //  * Handle a general key verification event.
+    //  *
+    //  * @private
+    //  * @param {module:models/event.MatrixEvent} event verification start event
+    //  */
+    // private onKeyVerificationMessage(event: MatrixEvent): void {
+    //     if (!ToDeviceChannel.validateEvent(event, this.baseApis)) {
+    //         return;
+    //     }
+    //     const createRequest = (event: MatrixEvent) => {
+    //         if (!ToDeviceChannel.canCreateRequest(ToDeviceChannel.getEventType(event))) {
+    //             return;
+    //         }
+    //         const content = event.getContent();
+    //         const deviceId = content && content.from_device;
+    //         if (!deviceId) {
+    //             return;
+    //         }
+    //         const userId = event.getSender();
+    //         const channel = new ToDeviceChannel(
+    //             this.baseApis,
+    //             userId,
+    //             [deviceId],
+    //         );
+    //         return new VerificationRequest(
+    //             channel, this.verificationMethods, this.baseApis);
+    //     };
+    //     this.handleVerificationEvent(event, this.toDeviceVerificationRequests, createRequest);
+    // }
 
     /**
      * Handle key verification requests sent as timeline events
@@ -3319,112 +3549,112 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         }
     }
 
-    /**
-     * Handle a toDevice event that couldn't be decrypted
-     *
-     * @private
-     * @param {module:models/event.MatrixEvent} event undecryptable event
-     */
-    private async onToDeviceBadEncrypted(event: MatrixEvent): Promise<void> {
-        const content = event.getWireContent();
-        const sender = event.getSender();
-        const algorithm = content.algorithm;
-        const deviceKey = content.sender_key;
+    // /**
+    //  * Handle a toDevice event that couldn't be decrypted
+    //  *
+    //  * @private
+    //  * @param {module:models/event.MatrixEvent} event undecryptable event
+    //  */
+    // private async onToDeviceBadEncrypted(event: MatrixEvent): Promise<void> {
+    //     const content = event.getWireContent();
+    //     const sender = event.getSender();
+    //     const algorithm = content.algorithm;
+    //     const deviceKey = content.sender_key;
 
-        // retry decryption for all events sent by the sender_key.  This will
-        // update the events to show a message indicating that the olm session was
-        // wedged.
-        const retryDecryption = () => {
-            const roomDecryptors = this.getRoomDecryptors(olmlib.MEGOLM_ALGORITHM);
-            for (const decryptor of roomDecryptors) {
-                decryptor.retryDecryptionFromSender(deviceKey);
-            }
-        };
+    //     // retry decryption for all events sent by the sender_key.  This will
+    //     // update the events to show a message indicating that the olm session was
+    //     // wedged.
+    //     const retryDecryption = () => {
+    //         const roomDecryptors = this.getRoomDecryptors(olmlib.MEGOLM_ALGORITHM);
+    //         for (const decryptor of roomDecryptors) {
+    //             decryptor.retryDecryptionFromSender(deviceKey);
+    //         }
+    //     };
 
-        if (sender === undefined || deviceKey === undefined || deviceKey === undefined) {
-            return;
-        }
+    //     if (sender === undefined || deviceKey === undefined || deviceKey === undefined) {
+    //         return;
+    //     }
 
-        // check when we last forced a new session with this device: if we've already done so
-        // recently, don't do it again.
-        this.lastNewSessionForced[sender] = this.lastNewSessionForced[sender] || {};
-        const lastNewSessionForced = this.lastNewSessionForced[sender][deviceKey] || 0;
-        if (lastNewSessionForced + MIN_FORCE_SESSION_INTERVAL_MS > Date.now()) {
-            logger.debug(
-                "New session already forced with device " + sender + ":" + deviceKey +
-                " at " + lastNewSessionForced + ": not forcing another",
-            );
-            await this.olmDevice.recordSessionProblem(deviceKey, "wedged", true);
-            retryDecryption();
-            return;
-        }
+    //     // check when we last forced a new session with this device: if we've already done so
+    //     // recently, don't do it again.
+    //     this.lastNewSessionForced[sender] = this.lastNewSessionForced[sender] || {};
+    //     const lastNewSessionForced = this.lastNewSessionForced[sender][deviceKey] || 0;
+    //     if (lastNewSessionForced + MIN_FORCE_SESSION_INTERVAL_MS > Date.now()) {
+    //         logger.debug(
+    //             "New session already forced with device " + sender + ":" + deviceKey +
+    //             " at " + lastNewSessionForced + ": not forcing another",
+    //         );
+    //         await this.olmDevice.recordSessionProblem(deviceKey, "wedged", true);
+    //         retryDecryption();
+    //         return;
+    //     }
 
-        // establish a new olm session with this device since we're failing to decrypt messages
-        // on a current session.
-        // Note that an undecryptable message from another device could easily be spoofed -
-        // is there anything we can do to mitigate this?
-        let device = this.deviceList.getDeviceByIdentityKey(algorithm, deviceKey);
-        if (!device) {
-            // if we don't know about the device, fetch the user's devices again
-            // and retry before giving up
-            await this.downloadKeys([sender], false);
-            device = this.deviceList.getDeviceByIdentityKey(algorithm, deviceKey);
-            if (!device) {
-                logger.info(
-                    "Couldn't find device for identity key " + deviceKey +
-                    ": not re-establishing session",
-                );
-                await this.olmDevice.recordSessionProblem(deviceKey, "wedged", false);
-                retryDecryption();
-                return;
-            }
-        }
-        const devicesByUser: Record<string, DeviceInfo[]> = {};
-        devicesByUser[sender] = [device];
-        await olmlib.ensureOlmSessionsForDevices(this.olmDevice, this.baseApis, devicesByUser, true);
+    //     // establish a new olm session with this device since we're failing to decrypt messages
+    //     // on a current session.
+    //     // Note that an undecryptable message from another device could easily be spoofed -
+    //     // is there anything we can do to mitigate this?
+    //     let device = this.deviceList.getDeviceByIdentityKey(algorithm, deviceKey);
+    //     if (!device) {
+    //         // if we don't know about the device, fetch the user's devices again
+    //         // and retry before giving up
+    //         await this.downloadKeys([sender], false);
+    //         device = this.deviceList.getDeviceByIdentityKey(algorithm, deviceKey);
+    //         if (!device) {
+    //             logger.info(
+    //                 "Couldn't find device for identity key " + deviceKey +
+    //                 ": not re-establishing session",
+    //             );
+    //             await this.olmDevice.recordSessionProblem(deviceKey, "wedged", false);
+    //             retryDecryption();
+    //             return;
+    //         }
+    //     }
+    //     const devicesByUser: Record<string, DeviceInfo[]> = {};
+    //     devicesByUser[sender] = [device];
+    //     await olmlib.ensureOlmSessionsForDevices(this.olmDevice, this.baseApis, devicesByUser, true);
 
-        this.lastNewSessionForced[sender][deviceKey] = Date.now();
+    //     this.lastNewSessionForced[sender][deviceKey] = Date.now();
 
-        // Now send a blank message on that session so the other side knows about it.
-        // (The keyshare request is sent in the clear so that won't do)
-        // We send this first such that, as long as the toDevice messages arrive in the
-        // same order we sent them, the other end will get this first, set up the new session,
-        // then get the keyshare request and send the key over this new session (because it
-        // is the session it has most recently received a message on).
-        const encryptedContent = {
-            algorithm: olmlib.OLM_ALGORITHM,
-            sender_key: this.olmDevice.deviceCurve25519Key,
-            ciphertext: {},
-        };
-        await olmlib.encryptMessageForDevice(
-            encryptedContent.ciphertext,
-            this.userId,
-            this.deviceId,
-            this.olmDevice,
-            sender,
-            device,
-            { type: "m.dummy" },
-        );
+    //     // Now send a blank message on that session so the other side knows about it.
+    //     // (The keyshare request is sent in the clear so that won't do)
+    //     // We send this first such that, as long as the toDevice messages arrive in the
+    //     // same order we sent them, the other end will get this first, set up the new session,
+    //     // then get the keyshare request and send the key over this new session (because it
+    //     // is the session it has most recently received a message on).
+    //     const encryptedContent = {
+    //         algorithm: olmlib.OLM_ALGORITHM,
+    //         sender_key: this.olmDevice.deviceCurve25519Key,
+    //         ciphertext: {},
+    //     };
+    //     await olmlib.encryptMessageForDevice(
+    //         encryptedContent.ciphertext,
+    //         this.userId,
+    //         this.deviceId,
+    //         this.olmDevice,
+    //         sender,
+    //         device,
+    //         { type: "m.dummy" },
+    //     );
 
-        await this.olmDevice.recordSessionProblem(deviceKey, "wedged", true);
-        retryDecryption();
+    //     await this.olmDevice.recordSessionProblem(deviceKey, "wedged", true);
+    //     retryDecryption();
 
-        await this.baseApis.sendToDevice("m.room.encrypted", {
-            [sender]: {
-                [device.deviceId]: encryptedContent,
-            },
-        });
+    //     await this.baseApis.sendToDevice("m.room.encrypted", {
+    //         [sender]: {
+    //             [device.deviceId]: encryptedContent,
+    //         },
+    //     });
 
-        // Most of the time this probably won't be necessary since we'll have queued up a key request when
-        // we failed to decrypt the message and will be waiting a bit for the key to arrive before sending
-        // it. This won't always be the case though so we need to re-send any that have already been sent
-        // to avoid races.
-        const requestsToResend =
-            await this.outgoingRoomKeyRequestManager.getOutgoingSentRoomKeyRequest(sender, device.deviceId);
-        for (const keyReq of requestsToResend) {
-            this.requestRoomKey(keyReq.requestBody, keyReq.recipients, true);
-        }
-    }
+    //     // Most of the time this probably won't be necessary since we'll have queued up a key request when
+    //     // we failed to decrypt the message and will be waiting a bit for the key to arrive before sending
+    //     // it. This won't always be the case though so we need to re-send any that have already been sent
+    //     // to avoid races.
+    //     const requestsToResend =
+    //         await this.outgoingRoomKeyRequestManager.getOutgoingSentRoomKeyRequest(sender, device.deviceId);
+    //     for (const keyReq of requestsToResend) {
+    //         this.requestRoomKey(keyReq.requestBody, keyReq.recipients, true);
+    //     }
+    // }
 
     /**
      * Handle a change in the membership state of a member of a room
@@ -3446,6 +3676,8 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         const roomId = member.roomId;
 
         const alg = this.roomEncryptors[roomId];
+
+        this.olmMachine.updateTrackedUsers([new UserId(member.userId)])
         if (!alg) {
             // not encrypting in this room
             return;
@@ -3469,25 +3701,25 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         alg.onRoomMembership(event, member, oldMembership);
     }
 
-    /**
-     * Called when we get an m.room_key_request event.
-     *
-     * @private
-     * @param {module:models/event.MatrixEvent} event key request event
-     */
-    private onRoomKeyRequestEvent(event: MatrixEvent): void {
-        const content = event.getContent();
-        if (content.action === "request") {
-            // Queue it up for now, because they tend to arrive before the room state
-            // events at initial sync, and we want to see if we know anything about the
-            // room before passing them on to the app.
-            const req = new IncomingRoomKeyRequest(event);
-            this.receivedRoomKeyRequests.push(req);
-        } else if (content.action === "request_cancellation") {
-            const req = new IncomingRoomKeyRequestCancellation(event);
-            this.receivedRoomKeyRequestCancellations.push(req);
-        }
-    }
+    // /**
+    //  * Called when we get an m.room_key_request event.
+    //  *
+    //  * @private
+    //  * @param {module:models/event.MatrixEvent} event key request event
+    //  */
+    // private onRoomKeyRequestEvent(event: MatrixEvent): void {
+    //     const content = event.getContent();
+    //     if (content.action === "request") {
+    //         // Queue it up for now, because they tend to arrive before the room state
+    //         // events at initial sync, and we want to see if we know anything about the
+    //         // room before passing them on to the app.
+    //         const req = new IncomingRoomKeyRequest(event);
+    //         this.receivedRoomKeyRequests.push(req);
+    //     } else if (content.action === "request_cancellation") {
+    //         const req = new IncomingRoomKeyRequestCancellation(event);
+    //         this.receivedRoomKeyRequestCancellations.push(req);
+    //     }
+    // }
 
     /**
      * Process any m.room_key_request events which were queued up during the
@@ -3694,22 +3926,22 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         return alg;
     }
 
-    /**
-     * Get all the room decryptors for a given encryption algorithm.
-     *
-     * @param {string} algorithm The encryption algorithm
-     *
-     * @return {array} An array of room decryptors
-     */
-    private getRoomDecryptors(algorithm: string): DecryptionAlgorithm[] {
-        const decryptors = [];
-        for (const d of Object.values(this.roomDecryptors)) {
-            if (algorithm in d) {
-                decryptors.push(d[algorithm]);
-            }
-        }
-        return decryptors;
-    }
+    // /**
+    //  * Get all the room decryptors for a given encryption algorithm.
+    //  *
+    //  * @param {string} algorithm The encryption algorithm
+    //  *
+    //  * @return {array} An array of room decryptors
+    //  */
+    // private getRoomDecryptors(algorithm: string): DecryptionAlgorithm[] {
+    //     const decryptors = [];
+    //     for (const d of Object.values(this.roomDecryptors)) {
+    //         if (algorithm in d) {
+    //             decryptors.push(d[algorithm]);
+    //         }
+    //     }
+    //     return decryptors;
+    // }
 
     /**
      * sign the given object with our ed25519 key

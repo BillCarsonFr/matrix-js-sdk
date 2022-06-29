@@ -1175,6 +1175,15 @@ export class SyncApi {
 
         // handle to-device events
         if (Array.isArray(data.to_device?.events) && data.to_device.events.length > 0) {
+            if(this.opts.crypto) {
+                this.opts.crypto.handlereceiveSyncChanges(
+                    data.to_device,
+                    data.device_lists,
+                    data.device_one_time_keys_count,
+                    data["device_unused_fallback_key_types"]
+                )
+            }
+
             const cancelledKeyVerificationTxns = [];
             data.to_device.events
                 .map(client.getEventMapper())

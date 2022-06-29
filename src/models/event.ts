@@ -34,6 +34,7 @@ import { TypedReEmitter } from '../ReEmitter';
 import { MatrixError } from "../http-api";
 import { TypedEventEmitter } from "./typed-event-emitter";
 import { EventStatus } from "./event-status";
+import { DecryptionError } from "../crypto/algorithms";
 
 export { EventStatus } from "./event-status";
 

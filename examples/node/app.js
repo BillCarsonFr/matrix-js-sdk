@@ -1,17 +1,88 @@
-var myUserId = "@example:localhost";
-var myAccessToken = "QGV4YW1wbGU6bG9jYWxob3N0.qPEvLuYfNBjxikiCjP";
-var sdk = require("matrix-js-sdk");
+var myUserId = "@web2:localhost:8482";
+//var myAccessToken = "syt_d2ViMg_yZbBpBrFYiYFLkFlEZoF_20QnJ4";
+global.Olm = require('olm');
+var sdk = require("matrix-js-sdk/lib");
 var clc = require("cli-color");
-var matrixClient = sdk.createClient({
-    baseUrl: "http://localhost:8008",
-    accessToken: myAccessToken,
-    userId: myUserId
+var request = require("request");
+
+const authClient = sdk.createClient({
+    request: request,
+    baseUrl: "http://localhost:8082",
+    // accessToken: myAccessToken,
+    userId: myUserId,
+    // cryptoStore: new sdk.MemoryCryptoStore(),
+    // sessionStore: new sdk.MemoryStore(),
+    //deviceId: "DevNull"
 });
+var matrixClient;
+// var matrixClient = sdk.createClient({
+//     request: request,
+//     baseUrl: "http://localhost:8082",
+//     // accessToken: myAccessToken,
+//     userId: myUserId,
+//     cryptoStore: new sdk.MemoryCryptoStore(),
+//     sessionStore: new sdk.MemoryStore(),
+//     //deviceId: "DevNull"
+// });
+var numMessagesToShow = 20;
+
+authClient.login("m.login.password", { "identifier": { "type": "m.id.user", "user": myUserId }, "password": "ThisIsATest" }).then((response) => {
+    console.log(response.access_token);
+    const sessionStore = new sdk.MemoryStore()
+    sessionStore.deleteAllData()
+    matrixClient = sdk.createClient({
+        request: request,
+        baseUrl: "http://localhost:8082",
+        accessToken: response.access_token,
+        userId: myUserId,
+        cryptoStore: new sdk.MemoryCryptoStore(),
+        sessionStore: sessionStore,
+        deviceId: response.device_id
+    });
+    //matrixClient.setDeviceDetails(response.device_id, {display_name : "Corroded-JS"})
+
+    // print incoming messages.
+    matrixClient.on("Room.timeline", function (event, room, toStartOfTimeline) {
+        if (toStartOfTimeline) {
+            return; // don't print paginated results
+        }
+        if (!viewingRoom || viewingRoom.roomId !== room.roomId) {
+            return; // not viewing a room or viewing the wrong room.
+        }
+        printLine(event);
+    });
+
+    // show the room list after syncing.
+    matrixClient.on("sync", function (state, prevState, data) {
+        console.log("## ON SYNC")
+        switch (state) {
+            case "PREPARED":
+                setRoomList();
+                printRoomList();
+                printHelp();
+                rl.prompt();
+                break;
+        }
+    });
+
+    matrixClient.on("Room", function () {
+        setRoomList();
+        if (!viewingRoom) {
+            printRoomList();
+            rl.prompt();
+        }
+    });
+
+    matrixClient.initCrypto().then( () => {
+        matrixClient.startClient(numMessagesToShow); 
+    })
+
+});
+
 
 // Data structures
 var roomList = [];
 var viewingRoom = null;
-var numMessagesToShow = 20;
 
 // Reading from stdin
 var CLEAR_CONSOLE = '\x1B[2J';
@@ -22,7 +93,7 @@ var rl = readline.createInterface({
     completer: completer
 });
 rl.setPrompt("$ ");
-rl.on('line', function(line) {
+rl.on('line', function (line) {
     if (line.trim().length === 0) {
         rl.prompt();
         return;
@@ -54,10 +125,10 @@ rl.on('line', function(line) {
                 }
             }
             if (notSentEvent) {
-                matrixClient.resendEvent(notSentEvent, viewingRoom).then(function() {
+                matrixClient.resendEvent(notSentEvent, viewingRoom).then(function () {
                     printMessages();
                     rl.prompt();
-                }, function(err) {
+                }, function (err) {
                     printMessages();
                     print("/resend Error: %s", err);
                     rl.prompt();
@@ -68,19 +139,19 @@ rl.on('line', function(line) {
         }
         else if (line.indexOf("/more ") === 0) {
             var amount = parseInt(line.split(" ")[1]) || 20;
-            matrixClient.scrollback(viewingRoom, amount).then(function(room) {
+            matrixClient.scrollback(viewingRoom, amount).then(function (room) {
                 printMessages();
                 rl.prompt();
-            }, function(err) {
+            }, function (err) {
                 print("/more Error: %s", err);
             });
         }
         else if (line.indexOf("/invite ") === 0) {
             var userId = line.split(" ")[1].trim();
-            matrixClient.invite(viewingRoom.roomId, userId).then(function() {
+            matrixClient.invite(viewingRoom.roomId, userId).then(function () {
                 printMessages();
                 rl.prompt();
-            }, function(err) {
+            }, function (err) {
                 print("/invite Error: %s", err);
             });
         }
@@ -90,7 +161,7 @@ rl.on('line', function(line) {
             matrixClient.uploadContent({
                 stream: stream,
                 name: filename
-            }).then(function(url) {
+            }).then(function (url) {
                 var content = {
                     msgtype: "m.file",
                     body: filename,
@@ -100,7 +171,7 @@ rl.on('line', function(line) {
             });
         }
         else {
-            matrixClient.sendTextMessage(viewingRoom.roomId, line).finally(function() {
+            matrixClient.sendTextMessage(viewingRoom.roomId, line).finally(function () {
                 printMessages();
                 rl.prompt();
             });
@@ -114,12 +185,12 @@ rl.on('line', function(line) {
             viewingRoom = roomList[roomIndex];
             if (viewingRoom.getMember(myUserId).membership === "invite") {
                 // join the room first
-                matrixClient.joinRoom(viewingRoom.roomId).then(function(room) {
+                matrixClient.joinRoom(viewingRoom.roomId).then(function (room) {
                     setRoomList();
                     viewingRoom = room;
                     printMessages();
                     rl.prompt();
-                }, function(err) {
+                }, function (err) {
                     print("/join Error: %s", err);
                 });
             }
@@ -132,46 +203,18 @@ rl.on('line', function(line) {
 });
 // ==== END User input
 
-// show the room list after syncing.
-matrixClient.on("sync", function(state, prevState, data) {
-    switch (state) {
-        case "PREPARED":
-          setRoomList();
-          printRoomList();
-          printHelp();
-          rl.prompt();
-        break;
-   }
-});
 
-matrixClient.on("Room", function() {
-    setRoomList();
-    if (!viewingRoom) {
-        printRoomList();
-        rl.prompt();
-    }
-});
 
-// print incoming messages.
-matrixClient.on("Room.timeline", function(event, room, toStartOfTimeline) {
-    if (toStartOfTimeline) {
-        return; // don't print paginated results
-    }
-    if (!viewingRoom || viewingRoom.roomId !== room.roomId) {
-        return; // not viewing a room or viewing the wrong room.
-    }
-    printLine(event);
-});
 
 function setRoomList() {
     roomList = matrixClient.getRooms();
-    roomList.sort(function(a,b) {
+    roomList.sort(function (a, b) {
         // < 0 = a comes first (lower index) - we want high indexes = newer
-        var aMsg = a.timeline[a.timeline.length-1];
+        var aMsg = a.timeline[a.timeline.length - 1];
         if (!aMsg) {
             return -1;
         }
-        var bMsg = b.timeline[b.timeline.length-1];
+        var bMsg = b.timeline[b.timeline.length - 1];
         if (!bMsg) {
             return 1;
         }
@@ -193,7 +236,7 @@ function printRoomList() {
         "leave": clc.blackBright
     };
     for (var i = 0; i < roomList.length; i++) {
-        var msg = roomList[i].timeline[roomList[i].timeline.length-1];
+        var msg = roomList[i].timeline[roomList[i].timeline.length - 1];
         var dateStr = "---";
         var fmt;
         if (msg) {
@@ -233,7 +276,7 @@ function completer(line) {
     var completions = [
         "/help", "/join ", "/exit", "/members", "/more ", "/resend", "/invite"
     ];
-    var hits = completions.filter(function(c) { return c.indexOf(line) == 0 });
+    var hits = completions.filter(function (c) { return c.indexOf(line) == 0 });
     // show all completions if none found
     return [hits.length ? hits : completions, line]
 }
@@ -259,7 +302,7 @@ function printMemberList(room) {
     };
     var members = room.currentState.getMembers();
     // sorted based on name.
-    members.sort(function(a, b) {
+    members.sort(function (a, b) {
         if (a.name > b.name) {
             return -1;
         }
@@ -270,16 +313,16 @@ function printMemberList(room) {
     });
     print("Membership list for room \"%s\"", room.name);
     print(new Array(room.name.length + 28).join("-"));
-    room.currentState.getMembers().forEach(function(member) {
+    room.currentState.getMembers().forEach(function (member) {
         if (!member.membership) {
             return;
         }
-        var fmt = fmts[member.membership] || function(a){return a;};
+        var fmt = fmts[member.membership] || function (a) { return a; };
         var membershipWithPadding = (
             member.membership + new Array(10 - member.membership.length).join(" ")
         );
         print(
-            "%s"+fmt(" :: ")+"%s"+fmt(" (")+"%s"+fmt(")"),
+            "%s" + fmt(" :: ") + "%s" + fmt(" (") + "%s" + fmt(")"),
             membershipWithPadding, member.name,
             (member.userId === myUserId ? "Me" : member.userId),
             fmt
@@ -296,16 +339,16 @@ function printRoomInfo(room) {
         100 - "Content".length - " | ".length - " | ".length -
         eTypeHeader.length - sendHeader.length
     );
-    var padSide = new Array(Math.floor(restCount/2)).join(" ");
+    var padSide = new Array(Math.floor(restCount / 2)).join(" ");
     var contentHeader = padSide + "Content" + padSide;
-    print(eTypeHeader+sendHeader+contentHeader);
+    print(eTypeHeader + sendHeader + contentHeader);
     print(new Array(100).join("-"));
-    eventMap.keys().forEach(function(eventType) {
+    eventMap.keys().forEach(function (eventType) {
         if (eventType === "m.room.member") { return; } // use /members instead.
         var eventEventMap = eventMap.get(eventType);
-        eventEventMap.keys().forEach(function(stateKey) {
+        eventEventMap.keys().forEach(function (stateKey) {
             var typeAndKey = eventType + (
-                stateKey.length > 0 ? "("+stateKey+")" : ""
+                stateKey.length > 0 ? "(" + stateKey + ")" : ""
             );
             var typeStr = fixWidth(typeAndKey, eTypeHeader.length);
             var event = eventEventMap.get(stateKey);
@@ -313,7 +356,7 @@ function printRoomInfo(room) {
             var contentStr = fixWidth(
                 JSON.stringify(event.getContent()), contentHeader.length
             );
-            print(typeStr+" | "+sendStr+" | "+contentStr);
+            print(typeStr + " | " + sendStr + " | " + contentStr);
         });
     })
 }
@@ -341,7 +384,7 @@ function printLine(event) {
 
     var maxNameWidth = 15;
     if (name.length > maxNameWidth) {
-        name = name.slice(0, maxNameWidth-1) + "\u2026";
+        name = name.slice(0, maxNameWidth - 1) + "\u2026";
     }
 
     if (event.getType() === "m.room.message") {
@@ -350,10 +393,10 @@ function printLine(event) {
     else if (event.isState()) {
         var stateName = event.getType();
         if (event.getStateKey().length > 0) {
-            stateName += " ("+event.getStateKey()+")";
+            stateName += " (" + event.getStateKey() + ")";
         }
         body = (
-            "[State: "+stateName+" updated to: "+JSON.stringify(event.getContent())+"]"
+            "[State: " + stateName + " updated to: " + JSON.stringify(event.getContent()) + "]"
         );
         separator = "---";
         fmt = clc.xterm(249).italic;
@@ -361,7 +404,7 @@ function printLine(event) {
     else {
         // random message event
         body = (
-            "[Message: "+event.getType()+" Content: "+JSON.stringify(event.getContent())+"]"
+            "[Message: " + event.getType() + " Content: " + JSON.stringify(event.getContent()) + "]"
         );
         separator = "---";
         fmt = clc.xterm(249).italic;
@@ -377,16 +420,16 @@ function printLine(event) {
 }
 
 function print(str, formatter) {
-    if (typeof arguments[arguments.length-1] === "function") {
+    if (typeof arguments[arguments.length - 1] === "function") {
         // last arg is the formatter so get rid of it and use it on each
         // param passed in but not the template string.
         var newArgs = [];
         var i = 0;
-        for (i=0; i<arguments.length-1; i++) {
+        for (i = 0; i < arguments.length - 1; i++) {
             newArgs.push(arguments[i]);
         }
-        var fmt = arguments[arguments.length-1];
-        for (i=0; i<newArgs.length; i++) {
+        var fmt = arguments[arguments.length - 1];
+        for (i = 0; i < newArgs.length; i++) {
             newArgs[i] = fmt(newArgs[i]);
         }
         console.log.apply(console.log, newArgs);
@@ -398,12 +441,10 @@ function print(str, formatter) {
 
 function fixWidth(str, len) {
     if (str.length > len) {
-        return str.substring(0, len-2) + "\u2026";
+        return str.substring(0, len - 2) + "\u2026";
     }
     else if (str.length < len) {
         return str + new Array(len - str.length).join(" ");
     }
     return str;
 }
-
-matrixClient.startClient(numMessagesToShow);  // messages for each room.
